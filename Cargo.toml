@@ -1,0 +1,13 @@
+[package]
+name = "nc-botwatch"
+version = "0.1.0"
+edition = "2021"
+default-run = "nc-botwatch"
+
+[dependencies]
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
