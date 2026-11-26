@@ -1,4 +1,3 @@
-Markdown
 # nc-botwatch
 
 Real-time on-chain forensics, state-bloat analysis, and multi-account bot detection tool for **Nine Chronicles**, written in Rust.
