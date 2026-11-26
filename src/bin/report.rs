@@ -248,7 +248,7 @@ fn main() -> Result<()> {
             }
             // Checa se valor líquido bate com taxa de mercado de 8% (múltiplo de 0.92)
             let div = s.3 / 0.92;
-            if s.3 > 0.0 && (div - div.round()).abs() < 0.015 {
+            if s.3 > 0.0 && (div - div.round()).abs() < 0.005 {
                 multiplos_092 += 1;
             }
         }
@@ -276,13 +276,13 @@ fn main() -> Result<()> {
         if pct_robo >= 0.6 {
             score += 25;
             evidencias.push(format!(
-                "[x] Perfil não-humano: {}/{n} contas fazem <=2 tipos de ação no jogo",
-                robo_perfil.len()
+                "[x] Baixa diversidade de ação: {}/{n} contas fazem <=2 tipos de ação no histórico observado (sinal fraco isolado: conta nova ou inativa também cai aqui)",
+                                    robo_perfil.len()
             ));
         }
 
         // Vértice 3: Funil de mercado / lavagem
-        if !vendedoras.is_empty() {
+        if vendedoras.len() * 10 >= (n.max(1) as usize) * 3 {
             score += 15;
             if let Some((b, itens, vol)) = buyers.first() {
                 evidencias.push(format!(
@@ -307,9 +307,12 @@ fn main() -> Result<()> {
         }
         if hub_txs <= 3 || sai_redondo {
             score += 5;
-            evidencias.push(format!(
-                "[x] Conta-mãe de passagem: hub assinou apenas {hub_txs} tx(s) no período"
-            ));
+            if hub_txs <= 3 {
+                evidencias.push(format!("[x] Hub quase não assina txs: {hub_txs} no banco"));
+            }
+            if sai_redondo {
+                evidencias.push("[x] Saída do hub em valor redondo (>= 100 NCG)".into());
+            }
         }
         score = score.min(100);
 
@@ -356,36 +359,31 @@ fn main() -> Result<()> {
         println!("└── Dossiê pronto:   {path}");
     }
 
-    // 2. Detector Secundário: Circuitos de Wash-Trading / Financiamento em Loop (mesmo sem ir pra ponte)
-    let loops: Vec<(String, String, i64, f64)> = {
+    // 2. Anéis de mercado: comprador e vendedor recebem transferência do MESMO financiador
+    let loops: Vec<(String, String, i64, f64, Option<String>)> = {
         let mut st = conn.prepare(
-            "SELECT m.src, m.dst, COUNT(*), ROUND(SUM(m.amount),2)
+            "SELECT m.src, m.dst, COUNT(*), ROUND(SUM(m.amount),2),
+                                  (SELECT f1.src FROM edges f1
+                                  JOIN edges f2 ON f2.kind='transfer' AND f2.src=f1.src AND f2.dst=m.dst
+                                  WHERE f1.kind='transfer' AND f1.dst=m.src LIMIT 1)
         FROM edges m
         WHERE m.kind='market'
-        AND m.src IN (SELECT DISTINCT dst FROM edges WHERE kind='transfer')
         GROUP BY m.src, m.dst
         HAVING COUNT(*) >= 4
-        ORDER BY 3 DESC LIMIT 5",
+        ORDER BY 3 DESC LIMIT 50",
         )?;
-        let it = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        let it = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
         it.collect::<Result<Vec<_>, _>>()?
     };
 
-    if !loops.is_empty() {
-        println!("\n⚠️  CIRCUITOS DE TRANSFERÊNCIA VIA MERCADO (Financiador -> Compra Dirigida):");
-        for (comprador, vendedor, itens, vol) in loops {
-            // Ignora vendedores que já fazem parte do hub principal acima
-            let ja_no_hub: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM edges WHERE kind='transfer' AND src=?1",
-                                                params![vendedor],
-                                                |r| r.get(0),
-            )?;
-            if ja_no_hub > 0 {
-                continue;
-            }
+    let aneis: Vec<_> = loops.into_iter().filter(|l| l.4.is_some()).collect();
+    if !aneis.is_empty() {
+        println!("\n⚠️  ANÉIS DE MERCADO (comprador e vendedor financiados pela mesma conta):");
+        for (comprador, vendedor, itens, vol, fin) in aneis {
             alertas_emitidos += 1;
             println!(
-                "├── Suspeito {comprador} (financiado) comprou {itens} itens ({vol:.2} NCG) de {vendedor}"
+                "├── {} financiou {comprador} (comprador) e {vendedor} (vendedor): {itens} itens, {vol:.2} NCG",
+                     fin.unwrap_or_default()
             );
         }
     }
