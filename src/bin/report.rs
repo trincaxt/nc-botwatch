@@ -1,9 +1,11 @@
-// Radar de Triangulação Multi-Account & Bots (nc-botwatch) — v2
+// Radar de Triangulação Multi-Account & Bots (nc-botwatch) — v3
 // Vértices: (1) Convergência financeira, (2) Perfil robótico refinado,
 //           (3) Funil de mercado, (4) Saída/Ponte,
-//           (5) Nonce sequencial, (6) Timing intra-bloco.
-// Anti-FP: score proporcional, whitelist de reward values, descontadores
-//           por gameplay real, janela temporal nos anéis de mercado.
+//           (5) Nonce sequencial, (6) Timing real da rajada (por tx_id).
+// Anti-FP: score proporcional, whitelist de reward values em centavos (i64),
+//          descontadores por gameplay real, janela temporal nos anéis de mercado.
+// Meta-Cluster: grafo persistente cruzando hubs por Jaccard >= 20%,
+//               transferência direta hub→hub ou saída externa compartilhada.
 // Output: terminal colorido, CSV enriquecido, NDJSON opcional (--json).
 //
 // Uso:
@@ -17,12 +19,21 @@ use std::fs;
 
 const BRIDGE: &str = "0x1c2ae97380cfb4f732049e454f6d9a25d4967c6f";
 
-// Valores de NCG que são rewards normais do jogo — não flagrar como script 0.92×
-// (enchantment rewards, crafting, daily, event prizes comuns)
-const REWARD_VALUES_NCG: &[f64] = &[
-    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 11.5, 12.0, 13.8, 15.0,
-    20.0, 23.0, 25.0, 46.0, 50.0, 100.0, 115.0, 230.0,
+// Valores de NCG em centavos (i64 exato: NCG * 100) que são rewards normais do jogo
+const REWARD_VALUES_CENTS: &[i64] = &[
+    100, 200, 300, 400, 500, 600, 700, 800, 1000, 1150, 1200, 1380, 1500,
+    2000, 2300, 2500, 4600, 5000, 10000, 11500, 23000,
 ];
+
+fn to_cents(ncg: f64) -> i64 {
+    (ncg * 100.0).round() as i64
+}
+
+fn fmt_cents(c: i64) -> String {
+    let sign = if c < 0 { "-" } else { "" };
+    let abs = c.abs();
+    format!("{sign}{}.{:02}", abs / 100, abs % 100)
+}
 
 // (lista de gameplay types usada em edges.rs — mantida aqui apenas como referência documental)
 
@@ -144,9 +155,9 @@ fn nivel_risco(score: u32) -> &'static str {
     }
 }
 
-/// Verifica se um valor de NCG é um reward natural do jogo (não script)
-fn is_reward_value(ncg: f64) -> bool {
-    REWARD_VALUES_NCG.iter().any(|&r| (ncg - r).abs() < 0.01)
+/// Verifica se um valor em centavos é um reward natural do jogo (não script)
+fn is_reward_cents(cents: i64) -> bool {
+    REWARD_VALUES_CENTS.contains(&cents)
 }
 
 /// Conta nonces sem buracos (sequência perfeita → sinal de bot)
@@ -164,22 +175,20 @@ fn nonce_gaps(conn: &Connection, signer: &str) -> i64 {
     .unwrap_or(999) // se falhar (poucas txs) devolve valor alto → não penaliza
 }
 
-/// Span em segundos entre a primeira e a última tx das contas-satélite no cluster
-fn timing_span_seconds(conn: &Connection, signers: &[String]) -> Option<f64> {
-    if signers.is_empty() {
+/// Span em segundos entre a primeira e a última tx de drenagem (filtrado por tx_id do cluster)
+fn timing_span_seconds(conn: &Connection, tx_ids: &[String]) -> Option<f64> {
+    if tx_ids.is_empty() {
         return None;
     }
-    // monta placeholders: ?1, ?2, ...
-    let placeholders: Vec<String> = (1..=signers.len()).map(|i| format!("?{i}")).collect();
+    let placeholders: Vec<String> = (1..=tx_ids.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
         "SELECT MAX(CAST(strftime('%s', ts) AS REAL)) - MIN(CAST(strftime('%s', ts) AS REAL))
-         FROM txs WHERE lower(signer) IN ({})",
+         FROM txs WHERE id IN ({})",
         placeholders.join(",")
     );
     let mut st = conn.prepare(&sql).ok()?;
-    // bind cada parâmetro dinamicamente
     let result: Option<f64> = {
-        let mut rows = st.query(rusqlite::params_from_iter(signers.iter())).ok()?;
+        let mut rows = st.query(rusqlite::params_from_iter(tx_ids.iter())).ok()?;
         rows.next().ok()??.get(0).ok()?
     };
     result
@@ -212,6 +221,226 @@ fn gameplay_count(conn: &Connection, signers: &[String]) -> i64 {
                 .ok()
         })
         .unwrap_or(0)
+}
+
+struct HubCluster {
+    hub: String,
+    score: u32,
+    is_active: bool,
+    start: i64,
+    end: i64,
+    total_cents: i64,
+    satellites: HashSet<String>,
+    exits_to: HashSet<String>,
+    non_bridge_exits: HashSet<String>,
+    bridge_cents: i64,
+    exit_flows: Vec<(i64, String, i64)>,
+}
+
+fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+fn uf_union(parent: &mut [usize], a: usize, b: usize) {
+    let ra = uf_find(parent, a);
+    let rb = uf_find(parent, b);
+    if ra != rb {
+        parent[rb] = ra;
+    }
+}
+
+fn emit_meta_clusters(hubs: &[HubCluster], json_mode: bool) -> Result<()> {
+    if hubs.len() < 2 {
+        return Ok(());
+    }
+    let mut parent: Vec<usize> = (0..hubs.len()).collect();
+    let mut link_reasons: Vec<(usize, usize, String)> = Vec::new();
+
+    for i in 0..hubs.len() {
+        for j in (i + 1)..hubs.len() {
+            let a = &hubs[i];
+            let b = &hubs[j];
+
+            let inter = a.satellites.intersection(&b.satellites).count();
+            let union_len = a.satellites.len() + b.satellites.len() - inter;
+            let jaccard_ok = union_len > 0 && inter * 5 >= union_len; // >= 20%
+
+            let direct_ab = a.exits_to.contains(&b.hub) || b.satellites.contains(&a.hub);
+            let direct_ba = b.exits_to.contains(&a.hub) || a.satellites.contains(&b.hub);
+            let shared_ext: Vec<&String> = a
+                .non_bridge_exits
+                .intersection(&b.non_bridge_exits)
+                .collect();
+
+            if jaccard_ok || direct_ab || direct_ba || !shared_ext.is_empty() {
+                uf_union(&mut parent, i, j);
+                let mut reasons = Vec::new();
+                if jaccard_ok {
+                    let pct = (inter as f64 / union_len as f64) * 100.0;
+                    reasons.push(format!("Jaccard {pct:.0}% ({inter}/{union_len} satélites)"));
+                }
+                if direct_ab {
+                    reasons.push(format!("{} → {}", &a.hub[..10], &b.hub[..10]));
+                }
+                if direct_ba {
+                    reasons.push(format!("{} → {}", &b.hub[..10], &a.hub[..10]));
+                }
+                if !shared_ext.is_empty() {
+                    reasons.push(format!("saída comum {}", &shared_ext[0][..10]));
+                }
+                link_reasons.push((i, j, reasons.join(" + ")));
+            }
+        }
+    }
+
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for i in 0..hubs.len() {
+        let r = uf_find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+
+    for (_root, members) in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        let member_set: HashSet<&str> = members.iter().map(|&idx| hubs[idx].hub.as_str()).collect();
+        let mut unique_sats: HashSet<&str> = HashSet::new();
+        let mut total_bruto_cents: i64 = 0;
+        let mut total_ponte_cents: i64 = 0;
+        let mut min_blk = i64::MAX;
+        let mut max_blk = i64::MIN;
+        let mut any_active = false;
+        let mut max_score = 0u32;
+
+        for &idx in &members {
+            let h = &hubs[idx];
+            total_bruto_cents += h.total_cents;
+            total_ponte_cents += h.bridge_cents;
+            min_blk = min_blk.min(h.start);
+            max_blk = max_blk.max(h.end);
+            any_active |= h.is_active;
+            max_score = max_score.max(h.score);
+            for s in &h.satellites {
+                if !member_set.contains(s.as_str()) {
+                    unique_sats.insert(s.as_str());
+                }
+            }
+        }
+
+        // Fluxos diretos entre hubs do meta-cluster
+        let mut hierarchy_flows: Vec<(i64, &str, &str, i64)> = Vec::new();
+        let mut internal_cents: i64 = 0;
+        for &idx in &members {
+            let h = &hubs[idx];
+            for (blk, dst, c) in &h.exit_flows {
+                if member_set.contains(dst.as_str()) {
+                    internal_cents += *c;
+                    hierarchy_flows.push((*blk, h.hub.as_str(), dst.as_str(), *c));
+                }
+            }
+        }
+        hierarchy_flows.sort_by_key(|f| f.0);
+
+        let first_hub = &hubs[members[0]].hub;
+        let meta_path = format!("meta_cluster_{}.csv", &first_hub[2..10]);
+        let mut csv = String::from("tipo,origem,destino,block_idx,ncg,score,ativo,satelites_hub\n");
+        for &idx in &members {
+            let h = &hubs[idx];
+            csv.push_str(&format!(
+                "hub,{},,{},{},{},{},{}\n",
+                h.hub,
+                h.start,
+                fmt_cents(h.total_cents),
+                h.score,
+                h.is_active,
+                h.satellites.len()
+            ));
+        }
+        for (blk, src, dst, c) in &hierarchy_flows {
+            csv.push_str(&format!(
+                "fluxo_hub_para_hub,{src},{dst},{blk},{},,,\n",
+                fmt_cents(*c)
+            ));
+        }
+        for &idx in &members {
+            let h = &hubs[idx];
+            for (blk, dst, c) in &h.exit_flows {
+                if !member_set.contains(dst.as_str()) {
+                    let kind = if dst == BRIDGE { "saida_ponte" } else { "saida_externa" };
+                    csv.push_str(&format!(
+                        "{kind},{},{dst},{blk},{},,,\n",
+                        h.hub,
+                        fmt_cents(*c)
+                    ));
+                }
+            }
+        }
+        fs::write(&meta_path, csv)?;
+
+        let status_icon = if any_active { "🟢 ATIVO" } else { "⚫ OFF" };
+        if json_mode {
+            let hub_list: Vec<String> = members.iter().map(|&i| format!("\"{}\"", hubs[i].hub)).collect();
+            println!(
+                "{{\"meta_cluster\":true,\"hubs\":[{}],\"ativo\":{any_active},\"score_max\":{max_score},\
+                 \"satelites_unicos\":{},\"total_bruto_ncg\":{},\"total_ponte_ncg\":{},\
+                 \"fluxo_interno_ncg\":{},\"dossie\":\"{meta_path}\"}}",
+                hub_list.join(","),
+                unique_sats.len(),
+                fmt_cents(total_bruto_cents),
+                fmt_cents(total_ponte_cents),
+                fmt_cents(internal_cents)
+            );
+        }
+
+        println!(
+            "\n🕸️  META-CLUSTER UNIFICADO [{status_icon}] ({} hubs conectados | Score máx: {max_score}/100)",
+            members.len()
+        );
+        println!(
+            "├── Escala Total:   {} NCG brutos ({} NCG direto p/ PONTE | {} NCG entre hubs)",
+            fmt_cents(total_bruto_cents),
+            fmt_cents(total_ponte_cents),
+            fmt_cents(internal_cents)
+        );
+        println!(
+            "├── Frota Única:    {} contas-satélite distintas | blocos {min_blk}..{max_blk}",
+            unique_sats.len()
+        );
+        println!("├── Hubs na Árvore:");
+        for &idx in &members {
+            let h = &hubs[idx];
+            let st = if h.is_active { "🟢 ATIVO" } else { "⚫ OFF" };
+            println!(
+                "│   ├── {} [{st}] ({}/100) — {} NCG, {} satélites (blocos {}..{})",
+                h.hub,
+                h.score,
+                fmt_cents(h.total_cents),
+                h.satellites.len(),
+                h.start,
+                h.end
+            );
+        }
+        if !hierarchy_flows.is_empty() {
+            println!("├── Hierarquia (Hub → Hub):");
+            for (blk, src, dst, c) in &hierarchy_flows {
+                println!("│   ├── {src} → {dst}: {} NCG (bloco {blk})", fmt_cents(*c));
+            }
+        }
+        let member_idx_set: HashSet<usize> = members.iter().copied().collect();
+        println!("├── Conexões Detectadas:");
+        for (i, j, reason) in &link_reasons {
+            if member_idx_set.contains(i) && member_idx_set.contains(j) {
+                println!("│   ├── {reason}");
+            }
+        }
+        println!("└── Dossiê Unificado: {meta_path}");
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -305,6 +534,7 @@ fn main() -> Result<()> {
     hubs.sort_by(|a, b| (b.1).1.cmp(&(a.1).1));
 
     let mut alertas_emitidos = 0;
+    let mut detected_hubs: Vec<HubCluster> = Vec::new();
     let tip_block: i64 = conn
         .query_row("SELECT COALESCE(MAX(idx), 0) FROM blocks", [], |r| r.get(0))
         .unwrap_or(0);
@@ -448,12 +678,10 @@ fn main() -> Result<()> {
                 vendedoras.insert(&s.2);
             }
 
-            // Múltiplos de 0,92 (pós-taxa 8%) — com whitelist de rewards normais
-            if ncg > 0.0 && !is_reward_value(ncg) {
-                let div = ncg / 0.92;
-                if (div - div.round()).abs() < 0.003 {
-                    multiplos_092 += 1;
-                }
+            // Múltiplos exatos de 0,92 NCG (92 centavos pós-taxa 8%) — aritmética inteira i64
+            let cents = to_cents(ncg);
+            if cents > 0 && !is_reward_cents(cents) && cents % 92 == 0 {
+                multiplos_092 += 1;
             }
         }
 
@@ -471,12 +699,13 @@ fn main() -> Result<()> {
             }
         }
 
-        // ── Vértice 6: Timing intra-bloco (contas distintas) ──────────────
+        // ── Vértice 6: Timing real da rajada (filtrado pelos tx_ids do cluster) ──
+        let tx_ids: Vec<String> = srcs.iter().map(|s| s.1.clone()).collect();
         let sat_signers: Vec<String> = {
             let uniq: HashSet<&String> = srcs.iter().map(|s| &s.2).collect();
             uniq.into_iter().cloned().collect()
         };
-        let timing_span = timing_span_seconds(&conn, &sat_signers);
+        let timing_span = timing_span_seconds(&conn, &tx_ids);
 
         // ── Gameplay real nas satélites ───────────────────────────────────
         let gameplay_confirmados = gameplay_count(&conn, &sat_signers);
@@ -548,9 +777,12 @@ fn main() -> Result<()> {
             ));
         }
 
-        // V4: Saída / Monetização
+        // V4: Saída / Monetização (aritmética inteira em centavos)
         let sai_ponte = exits.iter().any(|e| e.2 == BRIDGE);
-        let sai_redondo = exits.iter().any(|e| e.3.fract() == 0.0 && e.3 >= 100.0);
+        let sai_redondo = exits.iter().any(|e| {
+            let c = to_cents(e.3);
+            c >= 10_000 && c % 100 == 0
+        });
         if sai_ponte {
             score += 20; // elevado: ponte = monetização quase certa
             evidencias.push("[x] V4 Monetização: Hub transferiu direto para a PONTE Ethereum → +20pts".into());
@@ -572,17 +804,17 @@ fn main() -> Result<()> {
             ));
         }
 
-        // V6: Timing impossível para humanos
+        // V6: Timing real da rajada de drenagem (tx_id IN cluster)
         if let Some(span_s) = timing_span {
-            if span_s < 3.0 && n >= 10 {
+            if span_s <= 60.0 && n >= 10 {
                 score += 20;
                 evidencias.push(format!(
-                    "[x] V6 Sincronia extrema: {n} contas assinaram em {span_s:.2}s (impossível humanamente) → +20pts"
+                    "[x] V6 Rajada sincronizada: {n} contas drenaram em {span_s:.1}s → +20pts"
                 ));
-            } else if span_s < 10.0 && n >= 8 {
+            } else if span_s <= 240.0 && n >= 8 {
                 score += 10;
                 evidencias.push(format!(
-                    "[x] V6 Alta sincronia: {n} contas em {span_s:.2}s → +10pts"
+                    "[x] V6 Drenagem coordenada: {n} contas drenaram em {span_s:.1}s → +10pts"
                 ));
             }
         }
@@ -729,7 +961,41 @@ fn main() -> Result<()> {
             println!("│   {branch} {ev}");
         }
         println!("└── Dossiê:   {path}");
+
+        // Registra hub qualificado para o grafo de Meta-Clusters
+        let sat_set: HashSet<String> = srcs.iter().map(|s| s.2.clone()).collect();
+        let total_cents: i64 = srcs.iter().map(|s| to_cents(s.3)).sum();
+        let mut exits_to: HashSet<String> = HashSet::new();
+        let mut non_bridge_exits: HashSet<String> = HashSet::new();
+        let mut bridge_cents: i64 = 0;
+        let mut exit_flows: Vec<(i64, String, i64)> = Vec::new();
+        for e in &exits {
+            let c = to_cents(e.3);
+            exits_to.insert(e.2.clone());
+            if e.2 == BRIDGE {
+                bridge_cents += c;
+            } else {
+                non_bridge_exits.insert(e.2.clone());
+            }
+            exit_flows.push((e.0, e.2.clone(), c));
+        }
+        detected_hubs.push(HubCluster {
+            hub,
+            score,
+            is_active,
+            start,
+            end,
+            total_cents,
+            satellites: sat_set,
+            exits_to,
+            non_bridge_exits,
+            bridge_cents,
+            exit_flows,
+        });
     }
+
+    // ── 2. Agrupador de Meta-Clusters (Grafo Cruzado entre Hubs) ─────────
+    emit_meta_clusters(&detected_hubs, cfg.json)?;
 
     // ── 2. Anéis de mercado (com janela temporal ±500 blocos) ─────────────
     let loops: Vec<(String, String, i64, f64, Option<String>)> = {
