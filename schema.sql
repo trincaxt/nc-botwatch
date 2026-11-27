@@ -32,3 +32,25 @@ CREATE TABLE IF NOT EXISTS actions (
 
 CREATE INDEX IF NOT EXISTS idx_txs_signer_ts ON txs(signer, ts);
 CREATE INDEX IF NOT EXISTS idx_txs_block     ON txs(block_idx);
+CREATE INDEX IF NOT EXISTS idx_txs_nonce     ON txs(signer, nonce);
+
+-- Gameplay real: contas com hack_and_slash, crafting etc (prova de jogo humano)
+CREATE TABLE IF NOT EXISTS gameplay_flags (
+    tx_id       TEXT    NOT NULL,
+    block_idx   INTEGER NOT NULL,
+    signer      TEXT    NOT NULL,
+    action_type TEXT    NOT NULL,
+    PRIMARY KEY (tx_id, action_type)
+);
+CREATE INDEX IF NOT EXISTS idx_gf_signer ON gameplay_flags(signer);
+
+-- Histórico de scores por hub (série temporal — detecta escalada de operação)
+CREATE TABLE IF NOT EXISTS hub_score_history (
+    hub         TEXT    NOT NULL,
+    block_idx   INTEGER NOT NULL,
+    score       INTEGER NOT NULL,
+    origens     INTEGER NOT NULL,
+    total_ncg   REAL    NOT NULL,
+    recorded_at TEXT    DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (hub, block_idx)
+);

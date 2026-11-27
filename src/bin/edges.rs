@@ -160,20 +160,79 @@ fn main() -> Result<()> {
         Some("edges") => {
             conn.execute_batch(
                 "DROP TABLE IF EXISTS edges;
-                CREATE TABLE edges(
-                    tx_id TEXT, pos INTEGER, kind TEXT, block_idx INTEGER,
-                    src TEXT, dst TEXT, ticker TEXT, amount REAL, memo TEXT,
-                    PRIMARY KEY (tx_id, kind, pos));",
+                 CREATE TABLE edges(
+                     tx_id TEXT, pos INTEGER, kind TEXT, block_idx INTEGER,
+                     src TEXT, dst TEXT, ticker TEXT, amount REAL, memo TEXT,
+                     PRIMARY KEY (tx_id, kind, pos));
+                 CREATE TABLE IF NOT EXISTS gameplay_flags(
+                     tx_id       TEXT    NOT NULL,
+                     block_idx   INTEGER NOT NULL,
+                     signer      TEXT    NOT NULL,
+                     action_type TEXT    NOT NULL,
+                     PRIMARY KEY (tx_id, action_type));
+                 CREATE INDEX IF NOT EXISTS idx_gf_signer ON gameplay_flags(signer);",
             )?;
+
+            // Tipos que provam gameplay real (descontam score de bots)
+            const GAMEPLAY_TYPES: &[&str] = &[
+                "hack_and_slash",   "hack_and_slash2",  "hack_and_slash8",
+                "hack_and_slash9",  "hack_and_slash10", "hack_and_slash11",
+                "hack_and_slash12", "hack_and_slash13", "hack_and_slash14",
+                "hack_and_slash15", "hack_and_slash16", "hack_and_slash17",
+                "hack_and_slash18", "hack_and_slash19", "hack_and_slash20",
+                "hack_and_slash21", "combination_equipment",
+                "combination_equipment2", "combination_equipment3",
+                "combination_consumable", "combination_consumable2",
+                "rapid_combination", "rapid_combination2", "rapid_combination3",
+                "item_enhancement",  "item_enhancement2", "item_enhancement3",
+                "battle_arena", "join_arena", "raid", "raid2",
+                "grinding", "claim_raid_reward",
+            ];
+
+            // Registra gameplay_flags (sem raw necessário — usa type_id da coluna já extraída)
+            {
+                let gf_rows: Vec<(String, i64, String, String)> = {
+                    let placeholders: Vec<String> = GAMEPLAY_TYPES
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| format!("?{}", i + 1))
+                        .collect();
+                    let sql = format!(
+                        "SELECT t.id, t.block_idx, lower(t.signer), a.type_id
+                         FROM actions a JOIN txs t ON t.id=a.tx_id
+                         WHERE a.type_id IN ({})",
+                        placeholders.join(",")
+                    );
+                    let mut st = conn.prepare(&sql)?;
+                    let it = st.query_map(
+                        rusqlite::params_from_iter(GAMEPLAY_TYPES.iter()),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )?;
+                    it.collect::<Result<Vec<_>, _>>()?
+                };
+                let gftx = conn.transaction()?;
+                let mut gf_n = 0usize;
+                for (id, blk, sig, ty) in &gf_rows {
+                    gftx.execute(
+                        "INSERT OR IGNORE INTO gameplay_flags(tx_id, block_idx, signer, action_type)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![id, blk, sig, ty],
+                    )?;
+                    gf_n += 1;
+                }
+                gftx.commit()?;
+                eprintln!("{gf_n} gameplay_flags registradas");
+            }
+
             let rows: Vec<(String, i64, String, String)> = {
                 let mut st = conn.prepare(
                     "SELECT t.id, t.block_idx, lower(t.signer), a.raw
-                    FROM actions a JOIN txs t ON t.id = a.tx_id
-                    WHERE a.type_id IN ('transfer_asset5','buy_product3')",
+                     FROM actions a JOIN txs t ON t.id = a.tx_id
+                     WHERE a.type_id IN ('transfer_asset5','buy_product3')
+                       AND a.raw IS NOT NULL",
                 )?;
                 let it = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-                let v = it.collect::<Result<Vec<_>, _>>()?;
-                v
+                it.collect::<Result<Vec<_>, _>>()?
             };
             let dbtx = conn.transaction()?;
             let mut n = 0;
@@ -187,7 +246,7 @@ fn main() -> Result<()> {
                         let (ticker, amount) = get(vals, "amount").map(money).unwrap_or((None, None));
                         dbtx.execute(
                             "INSERT OR REPLACE INTO edges VALUES (?1,0,'transfer',?2,?3,?4,?5,?6,?7)",
-                                     params![id, blk, src, format!("0x{}", hex(r)), ticker, amount, memo],
+                            params![id, blk, src, format!("0x{}", hex(r)), ticker, amount, memo],
                         )?;
                         n += 1;
                     }
@@ -199,7 +258,7 @@ fn main() -> Result<()> {
                             let (ticker, amount) = money(price);
                             dbtx.execute(
                                 "INSERT OR REPLACE INTO edges VALUES (?1,?2,'market',?3,?4,?5,?6,?7,NULL)",
-                                         params![id, pos as i64, blk, src, format!("0x{}", hex(seller)), ticker, amount],
+                                params![id, pos as i64, blk, src, format!("0x{}", hex(seller)), ticker, amount],
                             )?;
                             n += 1;
                         }
@@ -216,6 +275,8 @@ fn main() -> Result<()> {
             print_q(&conn, "SELECT dst, COUNT(*), COUNT(DISTINCT src), ROUND(SUM(amount),2) FROM edges WHERE kind='market' GROUP BY dst ORDER BY 3 DESC, 2 DESC LIMIT 15")?;
             println!("\n== market: pares comprador->vendedor repetidos (src, dst, itens, total) ==");
             print_q(&conn, "SELECT src, dst, COUNT(*), ROUND(SUM(amount),2) FROM edges WHERE kind='market' GROUP BY src, dst HAVING COUNT(*) > 1 ORDER BY 3 DESC LIMIT 15")?;
+            println!("\n== gameplay: contas com ações reais (top 15) ==");
+            print_q(&conn, "SELECT signer, COUNT(DISTINCT action_type), COUNT(*) FROM gameplay_flags GROUP BY signer ORDER BY 2 DESC, 3 DESC LIMIT 15")?;
         }
         _ => eprintln!("uso: edges dump <type_id> [n] | edges edges"),
     }
