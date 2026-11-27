@@ -9,7 +9,7 @@
 // Uso:
 //   report [--db botwatch.db] [--min-origens 5] [--janela 60]
 //          [--ignore 0x..] [--ignore-file lista.txt]
-//          [--json] [--verbose] [--score-min 25]
+//          [--json] [--somente-novos] [--inativo-blocos 1000] [--score-min 25]
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, HashSet};
@@ -32,8 +32,24 @@ struct Cfg {
     window: i64,
     ignore: HashSet<String>,
     json: bool,
-    verbose: bool,
+    only_new: bool,
+    inactive_blocks: i64,
     score_min: u32,
+}
+
+/// Carrega um arquivo de whitelist (um endereço por linha, # = comentário)
+fn load_whitelist(path: &str, set: &mut HashSet<String>) -> usize {
+    let Ok(contents) = fs::read_to_string(path) else { return 0 };
+    let mut n = 0;
+    for line in contents.lines() {
+        // ignora comentários e texto após '#'
+        let clean = line.splitn(2, '#').next().unwrap_or("").trim();
+        if clean.starts_with("0x") {
+            set.insert(clean.to_lowercase());
+            n += 1;
+        }
+    }
+    n
 }
 
 fn parse_args() -> Cfg {
@@ -43,10 +59,19 @@ fn parse_args() -> Cfg {
         window: 60,
         ignore: HashSet::new(),
         json: false,
-        verbose: false,
+        only_new: false,
+        inactive_blocks: 1000,
         score_min: 25,
     };
+    // Bridge sempre ignorado
     c.ignore.insert(BRIDGE.to_string());
+
+    // Carrega whitelist.txt automaticamente se existir no diretório atual
+    const DEFAULT_WHITELIST: &str = "whitelist.txt";
+    let n = load_whitelist(DEFAULT_WHITELIST, &mut c.ignore);
+    if n > 0 {
+        eprintln!("whitelist: {n} endereço(s) carregado(s) de {DEFAULT_WHITELIST}");
+    }
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         match k.as_str() {
@@ -81,7 +106,14 @@ fn parse_args() -> Cfg {
                 }
             }
             "--json" => c.json = true,
-            "--verbose" => c.verbose = true,
+            "--verbose" => c.only_new = false,
+            "--somente-novos" => c.only_new = true,
+            "--inativo-blocos" => {
+                c.inactive_blocks = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--inativo-blocos precisa de número");
+            }
             "--score-min" => {
                 c.score_min = it
                     .next()
@@ -273,6 +305,9 @@ fn main() -> Result<()> {
     hubs.sort_by(|a, b| (b.1).1.cmp(&(a.1).1));
 
     let mut alertas_emitidos = 0;
+    let tip_block: i64 = conn
+        .query_row("SELECT COALESCE(MAX(idx), 0) FROM blocks", [], |r| r.get(0))
+        .unwrap_or(0);
 
     for (hub, (start, n, total, end)) in hubs {
         let prev: Option<(i64, f64)> = conn
@@ -289,8 +324,8 @@ fn main() -> Result<()> {
             Some(_) => "[já visto]",
         };
 
-        // Suprimir hubs já vistos sem mudanças (a menos que --verbose)
-        if status_tag == "[já visto]" && !cfg.verbose {
+        // Opcionalmente suprimir hubs já vistos sem mudanças se --somente-novos for passado
+        if status_tag == "[já visto]" && cfg.only_new {
             conn.execute(
                 "INSERT INTO seen_hubs(hub, last_origens, last_total) VALUES (?1, ?2, ?3)
                  ON CONFLICT(hub) DO UPDATE SET last_origens=excluded.last_origens,
@@ -299,6 +334,25 @@ fn main() -> Result<()> {
             )?;
             continue;
         }
+
+        let last_hub_tx: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(block_idx), 0) FROM txs WHERE lower(signer)=?1",
+                params![hub],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let last_hub_edge: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(block_idx), 0) FROM edges WHERE src=?1 OR dst=?1",
+                params![hub],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let last_act = end.max(last_hub_tx).max(last_hub_edge);
+        let blocks_since = (tip_block - last_act).max(0);
+        let is_active = blocks_since <= cfg.inactive_blocks;
+        let activity_tag = if is_active { "🟢 ATIVO" } else { "⚫ OFF" };
 
         let hub_txs: i64 = conn.query_row(
             "SELECT COUNT(*) FROM txs WHERE lower(signer)=?1",
@@ -403,11 +457,13 @@ fn main() -> Result<()> {
             }
         }
 
-        // ── Vértice 5: Nonce sequencial ───────────────────────────────────
+        // ── Vértice 5: Nonce sequencial (por conta distinta) ──────────────
+        let mut seen_nonce_signers: HashSet<&String> = HashSet::new();
+        let mut elegíveis = 0usize;
         let mut nonces_perfeitos = 0usize;
         for s in &srcs {
-            if s.4 >= 10 {
-                // só analisa contas com histórico suficiente
+            if s.4 >= 10 && seen_nonce_signers.insert(&s.2) {
+                elegíveis += 1;
                 let gaps = nonce_gaps(&conn, &s.2);
                 if gaps == 0 {
                     nonces_perfeitos += 1;
@@ -415,8 +471,11 @@ fn main() -> Result<()> {
             }
         }
 
-        // ── Vértice 6: Timing intra-bloco ────────────────────────────────
-        let sat_signers: Vec<String> = srcs.iter().map(|s| s.2.clone()).collect();
+        // ── Vértice 6: Timing intra-bloco (contas distintas) ──────────────
+        let sat_signers: Vec<String> = {
+            let uniq: HashSet<&String> = srcs.iter().map(|s| &s.2).collect();
+            uniq.into_iter().cloned().collect()
+        };
         let timing_span = timing_span_seconds(&conn, &sat_signers);
 
         // ── Gameplay real nas satélites ───────────────────────────────────
@@ -481,10 +540,11 @@ fn main() -> Result<()> {
                 ));
             }
         }
-        if multiplos_092 as f64 >= 0.5 * (n as f64) {
+        let total_transfers = srcs.len().max(1);
+        if multiplos_092 as f64 >= 0.5 * (total_transfers as f64) {
             score += 10;
             evidencias.push(format!(
-                "[x] V3 Valores de script: {multiplos_092}/{n} transferências são múltiplos de 0,92 (pós-taxa 8%, excluídos rewards normais) → +10pts"
+                "[x] V3 Valores de script: {multiplos_092}/{total_transfers} transferências são múltiplos de 0,92 (pós-taxa 8%, excluídos rewards normais) → +10pts"
             ));
         }
 
@@ -505,7 +565,6 @@ fn main() -> Result<()> {
         }
 
         // V5: Nonce sequencial (≥50% das contas com histórico suficiente)
-        let elegíveis = srcs.iter().filter(|s| s.4 >= 10).count();
         if elegíveis >= 3 && nonces_perfeitos * 2 >= elegíveis {
             score += 15;
             evidencias.push(format!(
@@ -637,6 +696,7 @@ fn main() -> Result<()> {
                 .collect();
             println!(
                 "{{\"hub\":\"{hub}\",\"score\":{score},\"nivel\":\"{}\",\
+                 \"ativo\":{is_active},\"ultimo_bloco\":{last_act},\"blocos_sem_mov\":{blocks_since},\
                  \"origens\":{n},\"total_ncg\":{total:.2},\"span_blocos\":{span},\
                  \"ponte\":{sai_ponte},\"status\":\"{status_tag}\",\
                  \"evidencias\":[{}]}}",
@@ -647,11 +707,17 @@ fn main() -> Result<()> {
 
         // ── Output terminal ───────────────────────────────────────────────
         println!(
-            "\n🚨 {} ALERTA DE CLUSTER (Score: {score}/100 — {})",
+            "\n🚨 {} [{}] ALERTA DE CLUSTER (Score: {score}/100 — {})",
             status_tag,
+            activity_tag,
             nivel_risco(score)
         );
         println!("├── Conta-Mãe (Hub): {hub}");
+        if is_active {
+            println!("├── Atividade:       {activity_tag} (última mov. bloco {last_act}, há {blocks_since} blocos | tip {tip_block})");
+        } else {
+            println!("├── Atividade:       {activity_tag} (sem movimentação há {blocks_since} blocos | último bloco {last_act} | tip {tip_block})");
+        }
         println!("├── Montante Drenado: {total:.2} NCG ({n} contas | blocos {start}..{end}, span {span} blocos)");
         for e in &exits {
             let tag = if e.2 == BRIDGE { " [PONTE]" } else { "" };

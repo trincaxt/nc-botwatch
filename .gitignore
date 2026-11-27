@@ -7,3 +7,4 @@ report_*.csv
 dossie_*.csv
 *.csv
 *.zip
+whitelist.txt
